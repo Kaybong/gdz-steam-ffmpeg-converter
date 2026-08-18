@@ -2,7 +2,8 @@
 
 const http = require('node:http');
 const { spawn } = require('node:child_process');
-const { createReadStream, promises: fs } = require('node:fs');
+const { promises: fs } = require('node:fs');
+const { Transform } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { randomUUID, timingSafeEqual } = require('node:crypto');
 const path = require('node:path');
@@ -130,7 +131,7 @@ async function downloadSteamCover(coverUrl, outputPath) {
     response = await fetch(coverUrl, {
       redirect: 'follow',
       signal: AbortSignal.timeout(30000),
-      headers: { 'user-agent': 'GDZ-Steam-FFmpeg-Converter/1.0.4' },
+      headers: { 'user-agent': 'GDZ-Steam-FFmpeg-Converter/1.0.5' },
     });
   } catch (cause) {
     const error = new Error(`Steam cover download failed: ${cause.message}`);
@@ -228,8 +229,7 @@ function buildEncodingProfile(durationSeconds) {
   };
 }
 
-function runFfmpeg(inputUrl, coverPath, outputPath, requestId, profile) {
-  return new Promise((resolve, reject) => {
+async function runFfmpegStream(inputUrl, coverPath, response, requestId, profile) {
     const filter = [
       `[0:v:0]scale=${profile.width}:${profile.height}:force_original_aspect_ratio=decrease,` +
         `pad=${profile.width}:${profile.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[main]`,
@@ -258,35 +258,66 @@ function runFfmpeg(inputUrl, coverPath, outputPath, requestId, profile) {
       '-pix_fmt', 'yuv420p',
       '-c:a', 'aac',
       '-b:a', `${AUDIO_BITRATE_KBPS}k`,
-      '-movflags', '+faststart',
+      '-force_key_frames', 'expr:gte(t,n_forced*2)',
+      '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
       '-max_muxing_queue_size', '2048',
-      '-y', outputPath,
+      '-f', 'mp4',
+      'pipe:1',
     ];
-    const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = '';
+    let outputBytes = 0;
+    let timedOut = false;
     child.stderr.on('data', (chunk) => {
       stderr = (stderr + chunk.toString()).slice(-8000);
     });
+    const counter = new Transform({
+      transform(chunk, encoding, callback) {
+        outputBytes += chunk.length;
+        if (outputBytes > MAX_OUTPUT_BYTES) {
+          const error = new Error(`Output exceeds ${Math.floor(MAX_OUTPUT_BYTES / MIB)} MB limit`);
+          error.code = 'OUTPUT_TOO_LARGE';
+          error.statusCode = 413;
+          return callback(error);
+        }
+        callback(null, chunk);
+      },
+    });
     const timer = setTimeout(() => {
+      timedOut = true;
       child.kill('SIGKILL');
-      const error = new Error('FFmpeg conversion timed out');
-      error.code = 'FFMPEG_TIMEOUT';
-      reject(error);
     }, FFMPEG_TIMEOUT_MS);
-    child.once('error', (error) => {
-      clearTimeout(timer);
-      reject(error);
+    const childDone = new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code, signal) => {
+        if (timedOut) {
+          const error = new Error('FFmpeg conversion timed out');
+          error.code = 'FFMPEG_TIMEOUT';
+          error.statusCode = 504;
+          return reject(error);
+        }
+        if (code === 0) return resolve();
+        const error = new Error(`FFmpeg failed with code ${code ?? 'null'} signal ${signal || 'none'}`);
+        error.code = 'FFMPEG_FAILED';
+        error.ffmpegOutput = stderr;
+        log('error', 'ffmpeg_failed', { request_id: requestId, code, signal, output: stderr });
+        reject(error);
+      });
     });
-    child.once('close', (code, signal) => {
+    try {
+      await Promise.all([childDone, pipeline(child.stdout, counter, response)]);
+      return outputBytes;
+    } catch (cause) {
+      if (child.exitCode === null && !child.killed) child.kill('SIGKILL');
+      if (cause?.code === 'ERR_STREAM_PREMATURE_CLOSE') {
+        const error = new Error('Client disconnected before conversion completed');
+        error.code = 'CLIENT_DISCONNECTED';
+        throw error;
+      }
+      throw cause;
+    } finally {
       clearTimeout(timer);
-      if (code === 0) return resolve();
-      const error = new Error(`FFmpeg failed with code ${code ?? 'null'} signal ${signal || 'none'}`);
-      error.code = 'FFMPEG_FAILED';
-      error.ffmpegOutput = stderr;
-      log('error', 'ffmpeg_failed', { request_id: requestId, code, signal, output: stderr });
-      reject(error);
-    });
-  });
+    }
 }
 
 async function handleConvert(req, res) {
@@ -306,7 +337,6 @@ async function handleConvert(req, res) {
     const coverUrl = validateSteamCover(body.cover_url);
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gdz-ffmpeg-'));
     const coverPath = path.join(tempDir, 'poster.jpg');
-    const outputPath = path.join(tempDir, 'trailer.mp4');
     const coverBytes = await downloadSteamCover(coverUrl, coverPath);
     const durationSeconds = await probeDuration(inputUrl, requestId);
     const profile = buildEncodingProfile(durationSeconds);
@@ -321,38 +351,35 @@ async function handleConvert(req, res) {
       video_bitrate_kbps: profile.videoKbps,
       output_width: profile.width,
       output_height: profile.height,
+      streaming_mode: 'fragmented_mp4',
     });
-    await runFfmpeg(inputUrl, coverPath, outputPath, requestId, profile);
-    const stat = await fs.stat(outputPath);
-    if (!stat.size) throw new Error('FFmpeg produced an empty output file');
-    if (stat.size > MAX_OUTPUT_BYTES) {
-      const error = new Error(`Output exceeds ${Math.floor(MAX_OUTPUT_BYTES / 1024 / 1024)} MB limit`);
-      error.statusCode = 413;
-      throw error;
-    }
     res.writeHead(200, {
       'content-type': 'video/mp4',
-      'content-length': stat.size,
       'content-disposition': 'attachment; filename="steam-trailer.mp4"',
-      'cache-control': 'no-store',
+      'cache-control': 'no-store, no-transform',
+      'x-accel-buffering': 'no',
       'x-request-id': requestId,
-      'x-conversion-ms': String(Date.now() - startedAt),
       'x-poster-seconds': String(POSTER_SECONDS),
       'x-video-bitrate-kbps': String(profile.videoKbps),
       'x-output-width': String(profile.width),
       'x-output-height': String(profile.height),
+      'x-streaming-mode': 'fragmented-mp4',
     });
-    await pipeline(createReadStream(outputPath), res);
+    res.socket?.setKeepAlive(true, 30000);
+    res.flushHeaders();
+    const outputBytes = await runFfmpegStream(inputUrl, coverPath, res, requestId, profile);
+    if (!outputBytes) throw new Error('FFmpeg produced an empty output stream');
     log('info', 'conversion_finished', {
       request_id: requestId,
       duration_ms: Date.now() - startedAt,
-      output_bytes: stat.size,
+      output_bytes: outputBytes,
       video_bitrate_kbps: profile.videoKbps,
       output_width: profile.width,
       output_height: profile.height,
     });
   } catch (error) {
-    log('error', 'conversion_error', {
+    const clientDisconnected = error.code === 'CLIENT_DISCONNECTED';
+    log(clientDisconnected ? 'warn' : 'error', clientDisconnected ? 'conversion_cancelled' : 'conversion_error', {
       request_id: requestId,
       message: error.message,
       code: error.code || null,
@@ -391,4 +418,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { buildEncodingProfile, probeDuration, runFfmpeg };
+module.exports = { buildEncodingProfile, probeDuration, runFfmpegStream };

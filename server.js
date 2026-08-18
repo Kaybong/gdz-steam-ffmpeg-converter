@@ -14,7 +14,7 @@ const PORT = Number(process.env.PORT || 3000);
 const API_TOKEN = String(process.env.CONVERTER_API_TOKEN || '');
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_OUTPUT_BYTES = Number(process.env.MAX_OUTPUT_MB || 48) * MIB;
-const TARGET_OUTPUT_BYTES = Math.max(
+const TELEGRAM_TARGET_OUTPUT_BYTES = Math.max(
   5 * MIB,
   Math.min(Number(process.env.TARGET_OUTPUT_MB || 44) * MIB, MAX_OUTPUT_BYTES - 2 * MIB),
 );
@@ -131,7 +131,7 @@ async function downloadSteamCover(coverUrl, outputPath) {
     response = await fetch(coverUrl, {
       redirect: 'follow',
       signal: AbortSignal.timeout(30000),
-      headers: { 'user-agent': 'GDZ-Steam-FFmpeg-Converter/1.0.5' },
+      headers: { 'user-agent': 'GDZ-Steam-FFmpeg-Converter/1.1.0' },
     });
   } catch (cause) {
     const error = new Error(`Steam cover download failed: ${cause.message}`);
@@ -210,19 +210,33 @@ function probeDuration(inputUrl, requestId) {
   });
 }
 
-function buildEncodingProfile(durationSeconds) {
-  const budgetKbps = Math.floor((TARGET_OUTPUT_BYTES * 8 * 0.96) / durationSeconds / 1000);
-  const uncappedVideoKbps = budgetKbps - AUDIO_BITRATE_KBPS;
-  if (uncappedVideoKbps < MIN_VIDEO_BITRATE_KBPS) {
+function buildEncodingProfile(durationSeconds, profileName = 'telegram') {
+  const webProfile = profileName === 'web';
+  const targetOutputBytes = webProfile
+    ? Math.min(Number(process.env.WEB_TARGET_OUTPUT_MB || 12) * MIB, 14 * MIB)
+    : TELEGRAM_TARGET_OUTPUT_BYTES;
+  const maxOutputBytes = webProfile
+    ? Math.min(Number(process.env.WEB_MAX_OUTPUT_MB || 16) * MIB, 18 * MIB)
+    : MAX_OUTPUT_BYTES;
+  const audioKbps = webProfile ? 96 : AUDIO_BITRATE_KBPS;
+  const minVideoKbps = webProfile ? 280 : MIN_VIDEO_BITRATE_KBPS;
+  const maxVideoKbps = webProfile ? 2400 : MAX_VIDEO_BITRATE_KBPS;
+  const budgetKbps = Math.floor((targetOutputBytes * 8 * 0.96) / durationSeconds / 1000);
+  const uncappedVideoKbps = budgetKbps - audioKbps;
+  if (uncappedVideoKbps < minVideoKbps) {
     const error = new Error('Steam trailer is too long for the configured output limit');
     error.code = 'TRAILER_TOO_LONG';
     error.statusCode = 413;
     throw error;
   }
-  const videoKbps = Math.min(MAX_VIDEO_BITRATE_KBPS, uncappedVideoKbps);
+  const videoKbps = Math.min(maxVideoKbps, uncappedVideoKbps);
   return {
+    name: webProfile ? 'web' : 'telegram',
     width: 1280,
     height: 720,
+    audioKbps,
+    targetOutputBytes,
+    maxOutputBytes,
     videoKbps,
     maxrateKbps: Math.ceil(videoKbps * 1.1),
     bufsizeKbps: videoKbps * 2,
@@ -257,7 +271,7 @@ async function runFfmpegStream(inputUrl, coverPath, response, requestId, profile
       '-level:v', '4.0',
       '-pix_fmt', 'yuv420p',
       '-c:a', 'aac',
-      '-b:a', `${AUDIO_BITRATE_KBPS}k`,
+      '-b:a', `${profile.audioKbps}k`,
       '-force_key_frames', 'expr:gte(t,n_forced*2)',
       '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
       '-max_muxing_queue_size', '2048',
@@ -274,8 +288,8 @@ async function runFfmpegStream(inputUrl, coverPath, response, requestId, profile
     const counter = new Transform({
       transform(chunk, encoding, callback) {
         outputBytes += chunk.length;
-        if (outputBytes > MAX_OUTPUT_BYTES) {
-          const error = new Error(`Output exceeds ${Math.floor(MAX_OUTPUT_BYTES / MIB)} MB limit`);
+        if (outputBytes > profile.maxOutputBytes) {
+          const error = new Error(`Output exceeds ${Math.floor(profile.maxOutputBytes / MIB)} MB limit`);
           error.code = 'OUTPUT_TOO_LARGE';
           error.statusCode = 413;
           return callback(error);
@@ -333,13 +347,14 @@ async function handleConvert(req, res) {
   activeConversion = true;
   try {
     const body = await readJson(req);
+    const profileName = body.profile === 'web' ? 'web' : 'telegram';
     const inputUrl = validateSteamHls(body.hls_url);
     const coverUrl = validateSteamCover(body.cover_url);
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gdz-ffmpeg-'));
     const coverPath = path.join(tempDir, 'poster.jpg');
     const coverBytes = await downloadSteamCover(coverUrl, coverPath);
     const durationSeconds = await probeDuration(inputUrl, requestId);
-    const profile = buildEncodingProfile(durationSeconds);
+    const profile = buildEncodingProfile(durationSeconds, profileName);
     log('info', 'conversion_started', {
       request_id: requestId,
       host: new URL(inputUrl).hostname,
@@ -347,7 +362,8 @@ async function handleConvert(req, res) {
       cover_bytes: coverBytes,
       poster_seconds: POSTER_SECONDS,
       duration_seconds: Number(durationSeconds.toFixed(3)),
-      target_output_mb: Number((TARGET_OUTPUT_BYTES / MIB).toFixed(2)),
+      profile: profile.name,
+      target_output_mb: Number((profile.targetOutputBytes / MIB).toFixed(2)),
       video_bitrate_kbps: profile.videoKbps,
       output_width: profile.width,
       output_height: profile.height,
@@ -355,7 +371,7 @@ async function handleConvert(req, res) {
     });
     res.writeHead(200, {
       'content-type': 'video/mp4',
-      'content-disposition': 'attachment; filename="steam-trailer.mp4"',
+      'content-disposition': `attachment; filename="steam-trailer-${profile.name}.mp4"`,
       'cache-control': 'no-store, no-transform',
       'x-accel-buffering': 'no',
       'x-request-id': requestId,
@@ -363,6 +379,7 @@ async function handleConvert(req, res) {
       'x-video-bitrate-kbps': String(profile.videoKbps),
       'x-output-width': String(profile.width),
       'x-output-height': String(profile.height),
+      'x-conversion-profile': profile.name,
       'x-streaming-mode': 'fragmented-mp4',
     });
     res.socket?.setKeepAlive(true, 30000);
@@ -401,7 +418,7 @@ async function handleConvert(req, res) {
 
 const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
-    return sendJson(res, 200, { status: 'ok', service: 'gdz-steam-ffmpeg-converter' });
+    return sendJson(res, 200, { status: 'ok', service: 'gdz-steam-ffmpeg-converter', version: '1.1.0', profiles: ['telegram', 'web'] });
   }
   if (req.method === 'POST' && req.url === '/convert') {
     return handleConvert(req, res);

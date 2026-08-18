@@ -1,4 +1,4 @@
-# GDZ Steam FFmpeg Converter — Railway v1.0.5
+# GDZ Steam FFmpeg Converter — Railway v1.1.0
 
 Небольшой защищённый HTTP-сервис для преобразования Steam HLS (`.m3u8`) в MP4, совместимый с Telegram `sendVideo`.
 
@@ -22,7 +22,8 @@ Content-Type: application/json
 ```json
 {
   "hls_url": "https://video.akamai.steamstatic.com/.../hls_264_master.m3u8?...",
-  "cover_url": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/.../movie_600x337.jpg?..."
+  "cover_url": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/.../movie_600x337.jpg?...",
+  "profile": "telegram"
 }
 ```
 
@@ -40,6 +41,8 @@ Content-Type: application/json
 - `TARGET_OUTPUT_MB=44`
 - `FFMPEG_TIMEOUT_SECONDS=240`
 - `POSTER_SECONDS=1.5`
+- `WEB_TARGET_OUTPUT_MB=12`
+- `WEB_MAX_OUTPUT_MB=16`
 
 `PORT` Railway добавляет автоматически.
 
@@ -106,3 +109,9 @@ Content-Type: application/json
 - FFmpeg больше не ждёт полного временного MP4: fragmented MP4 передаётся в HTTP-ответ сразу и продолжает поступать фрагментами каждые две секунды.
 - При закрытии клиента FFmpeg немедленно останавливается, временные файлы удаляются, а слот конвертера освобождается до повторной попытки.
 - Поток контролируется по количеству переданных байтов; жёсткий предел `MAX_OUTPUT_MB=48` сохранён.
+
+## Изменения v1.1.0
+
+- Добавлен параметр `profile`: `telegram` сохраняет прежнее поведение, `web` создаёт отдельный облегчённый MP4 для сайта и Telegram Mini App.
+- Web-профиль сохраняет `1280×720`, H.264/AAC и целится примерно в `12 MiB` с жёстким пределом `16 MiB`.
+- Лимиты Telegram и web считаются независимо, поэтому облегчение сайта не меняет качество ролика в Telegram-канале.

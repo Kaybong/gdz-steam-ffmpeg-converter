@@ -99,7 +99,9 @@ function runFfmpeg(inputUrl, outputPath, requestId) {
       '-i', inputUrl,
       '-map', '0:v:0',
       '-map', '0:a:0?',
-      '-vf', 'scale=854:-2:force_original_aspect_ratio=decrease',
+      // libx264 with yuv420p requires even frame dimensions. A fixed even
+      // width plus -2 for height preserves aspect ratio and guarantees both.
+      '-vf', 'scale=854:-2',
       '-c:v', 'libx264',
       '-preset', 'veryfast',
       '-crf', '23',
@@ -213,4 +215,3 @@ server.listen(PORT, '0.0.0.0', () => {
   if (!API_TOKEN) log('error', 'configuration_error', { message: 'CONVERTER_API_TOKEN is not set' });
   log('info', 'service_started', { port: PORT });
 });
-

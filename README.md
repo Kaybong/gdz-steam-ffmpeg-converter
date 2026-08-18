@@ -1,4 +1,4 @@
-# GDZ Steam FFmpeg Converter — Railway v1.0.2
+# GDZ Steam FFmpeg Converter — Railway v1.0.3
 
 Небольшой защищённый HTTP-сервис для преобразования Steam HLS (`.m3u8`) в MP4, совместимый с Telegram `sendVideo`.
 
@@ -21,7 +21,8 @@ Content-Type: application/json
 
 ```json
 {
-  "hls_url": "https://video.akamai.steamstatic.com/.../hls_264_master.m3u8?..."
+  "hls_url": "https://video.akamai.steamstatic.com/.../hls_264_master.m3u8?...",
+  "cover_url": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/.../movie_600x337.jpg?..."
 }
 ```
 
@@ -37,6 +38,7 @@ Content-Type: application/json
 
 - `MAX_OUTPUT_MB=48`
 - `FFMPEG_TIMEOUT_SECONDS=240`
+- `POSTER_SECONDS=1.5`
 
 `PORT` Railway добавляет автоматически.
 
@@ -77,3 +79,12 @@ Content-Type: application/json
 - Пропорции источника сохраняются: без квадратного кадрирования, обрезки и растягивания.
 - Качество видео повышено до `CRF 20`, preset `fast`, H.264 High Profile Level 4.0.
 - Качество звука повышено со 128 до 160 кбит/с AAC.
+
+## Изменения v1.0.3
+
+- Добавлен обязательный `cover_url` с официальным Steam JPEG.
+- JPEG встраивается непосредственно в первые 1,5 секунды видеопотока как poster-frame overlay.
+- Длительность и звуковая дорожка трейлера не сдвигаются: обложка заменяет только начальные кадры.
+- Итоговое видео всегда имеет холст `1280×720`; исходник и poster вписываются без обрезки и растягивания.
+- Добавлена проверка домена и пути Steam-обложки; сторонние изображения блокируются.
+- Railway скачивает JPEG ровно один раз, проверяет MIME, размер и JPEG-сигнатуру, после чего FFmpeg читает локальный временный файл.

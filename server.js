@@ -13,6 +13,7 @@ const API_TOKEN = String(process.env.CONVERTER_API_TOKEN || '');
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_OUTPUT_BYTES = Number(process.env.MAX_OUTPUT_MB || 48) * 1024 * 1024;
 const FFMPEG_TIMEOUT_MS = Number(process.env.FFMPEG_TIMEOUT_SECONDS || 240) * 1000;
+const POSTER_SECONDS = Math.min(3, Math.max(0.5, Number(process.env.POSTER_SECONDS || 1.5)));
 const ALLOWED_HOSTS = new Set([
   'video.akamai.steamstatic.com',
   'cdn.akamai.steamstatic.com',
@@ -90,19 +91,94 @@ function validateSteamHls(value) {
   return url.toString();
 }
 
-function runFfmpeg(inputUrl, outputPath, requestId) {
+function validateSteamCover(value) {
+  let url;
+  try {
+    url = new URL(String(value || ''));
+  } catch {
+    const error = new Error('cover_url must be a valid URL');
+    error.statusCode = 400;
+    throw error;
+  }
+  const hostname = url.hostname.toLowerCase();
+  const pathname = url.pathname.toLowerCase();
+  if (url.protocol !== 'https:' || hostname !== 'shared.akamai.steamstatic.com') {
+    const error = new Error('cover_url host is not allowed');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!pathname.startsWith('/store_item_assets/steam/apps/') || !/\.jpe?g$/.test(pathname)) {
+    const error = new Error('cover_url must point to a Steam JPEG asset');
+    error.statusCode = 400;
+    throw error;
+  }
+  return url.toString();
+}
+
+async function downloadSteamCover(coverUrl, outputPath) {
+  let response;
+  try {
+    response = await fetch(coverUrl, {
+      redirect: 'follow',
+      signal: AbortSignal.timeout(30000),
+      headers: { 'user-agent': 'GDZ-Steam-FFmpeg-Converter/1.0.3' },
+    });
+  } catch (cause) {
+    const error = new Error(`Steam cover download failed: ${cause.message}`);
+    error.code = 'COVER_DOWNLOAD_FAILED';
+    error.statusCode = 502;
+    throw error;
+  }
+  if (!response.ok) {
+    const error = new Error(`Steam cover returned HTTP ${response.status}`);
+    error.code = 'COVER_DOWNLOAD_FAILED';
+    error.statusCode = 502;
+    throw error;
+  }
+  const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+  if (!contentType.startsWith('image/jpeg')) {
+    const error = new Error('Steam cover response is not JPEG');
+    error.code = 'INVALID_COVER_FILE';
+    error.statusCode = 502;
+    throw error;
+  }
+  const cover = Buffer.from(await response.arrayBuffer());
+  if (!cover.length || cover.length > 2 * 1024 * 1024) {
+    const error = new Error('Steam cover size is invalid');
+    error.code = 'INVALID_COVER_FILE';
+    error.statusCode = 502;
+    throw error;
+  }
+  if (cover[0] !== 0xff || cover[1] !== 0xd8 || cover[2] !== 0xff) {
+    const error = new Error('Steam cover has an invalid JPEG signature');
+    error.code = 'INVALID_COVER_FILE';
+    error.statusCode = 502;
+    throw error;
+  }
+  await fs.writeFile(outputPath, cover);
+  return cover.length;
+}
+
+function runFfmpeg(inputUrl, coverPath, outputPath, requestId) {
   return new Promise((resolve, reject) => {
+    const filter = [
+      '[0:v:0]scale=1280:720:force_original_aspect_ratio=decrease,' +
+        'pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1[main]',
+      '[1:v:0]scale=1280:720:force_original_aspect_ratio=decrease,' +
+        'pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1[poster]',
+      `[main][poster]overlay=0:0:enable='lt(t,${POSTER_SECONDS})':shortest=1[v]`,
+    ].join(';');
     const args = [
       '-nostdin',
       '-hide_banner',
       '-loglevel', 'warning',
       '-i', inputUrl,
-      '-map', '0:v:0',
+      '-loop', '1',
+      '-framerate', '30',
+      '-i', coverPath,
+      '-filter_complex', filter,
+      '-map', '[v]',
       '-map', '0:a:0?',
-      // Steam trailers are normally 16:9. A fixed even 1280 px width plus -2
-      // preserves the source aspect ratio and guarantees an even height for
-      // libx264/yuv420p. There is no crop, square canvas or stretching.
-      '-vf', 'scale=1280:-2',
       '-c:v', 'libx264',
       '-preset', 'fast',
       '-crf', '20',
@@ -156,10 +232,19 @@ async function handleConvert(req, res) {
   try {
     const body = await readJson(req);
     const inputUrl = validateSteamHls(body.hls_url);
+    const coverUrl = validateSteamCover(body.cover_url);
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gdz-ffmpeg-'));
+    const coverPath = path.join(tempDir, 'poster.jpg');
     const outputPath = path.join(tempDir, 'trailer.mp4');
-    log('info', 'conversion_started', { request_id: requestId, host: new URL(inputUrl).hostname });
-    await runFfmpeg(inputUrl, outputPath, requestId);
+    const coverBytes = await downloadSteamCover(coverUrl, coverPath);
+    log('info', 'conversion_started', {
+      request_id: requestId,
+      host: new URL(inputUrl).hostname,
+      cover_host: new URL(coverUrl).hostname,
+      cover_bytes: coverBytes,
+      poster_seconds: POSTER_SECONDS,
+    });
+    await runFfmpeg(inputUrl, coverPath, outputPath, requestId);
     const stat = await fs.stat(outputPath);
     if (!stat.size) throw new Error('FFmpeg produced an empty output file');
     if (stat.size > MAX_OUTPUT_BYTES) {
@@ -174,6 +259,7 @@ async function handleConvert(req, res) {
       'cache-control': 'no-store',
       'x-request-id': requestId,
       'x-conversion-ms': String(Date.now() - startedAt),
+      'x-poster-seconds': String(POSTER_SECONDS),
     });
     await pipeline(createReadStream(outputPath), res);
     log('info', 'conversion_finished', {

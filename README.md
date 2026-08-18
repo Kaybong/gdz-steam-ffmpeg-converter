@@ -1,4 +1,4 @@
-# GDZ Steam FFmpeg Converter — Railway v1.1.0
+# GDZ Steam FFmpeg Converter — Railway v1.2.0
 
 Небольшой защищённый HTTP-сервис для преобразования Steam HLS (`.m3u8`) в MP4, совместимый с Telegram `sendVideo`.
 
@@ -39,10 +39,10 @@ Content-Type: application/json
 
 - `MAX_OUTPUT_MB=48`
 - `TARGET_OUTPUT_MB=44`
-- `FFMPEG_TIMEOUT_SECONDS=240`
+- `FFMPEG_TIMEOUT_SECONDS=360`
 - `POSTER_SECONDS=1.5`
-- `WEB_TARGET_OUTPUT_MB=12`
-- `WEB_MAX_OUTPUT_MB=16`
+- `WEB_TARGET_OUTPUT_MB=36`
+- `WEB_MAX_OUTPUT_MB=42`
 
 `PORT` Railway добавляет автоматически.
 
@@ -64,7 +64,7 @@ Content-Type: application/json
 - Разрешены только HTTPS URL с утверждённых Steam CDN hosts.
 - Одновременно выполняется одна конвертация; следующая получает HTTP `429`.
 - Входной JSON ограничен 16 KiB.
-- FFmpeg timeout по умолчанию 240 секунд.
+- FFmpeg timeout по умолчанию 360 секунд.
 - Итоговый файл ограничен 48 MiB.
 - Каждый запрос использует отдельную временную директорию, которая удаляется после ответа.
 - Токен не записывается в логи.
@@ -115,3 +115,11 @@ Content-Type: application/json
 - Добавлен параметр `profile`: `telegram` сохраняет прежнее поведение, `web` создаёт отдельный облегчённый MP4 для сайта и Telegram Mini App.
 - Web-профиль сохраняет `1280×720`, H.264/AAC и целится примерно в `12 MiB` с жёстким пределом `16 MiB`.
 - Лимиты Telegram и web считаются независимо, поэтому облегчение сайта не меняет качество ролика в Telegram-канале.
+
+## Изменения v1.2.0
+
+- Web-профиль переведён в режим Web HQ: целевой размер `36 MiB`, жёсткий предел `42 MiB`.
+- Для web используется H.264 High Profile `1280×720`, исходная частота кадров до 60 FPS, AAC `128 кбит/с` и preset `medium`.
+- Максимальный видеобитрейт web повышен до `4000 кбит/с`; для длинных роликов битрейт рассчитывается по длительности и доступному размеру.
+- Telegram-профиль не изменён: цель `44 MiB`, предел `48 MiB`, preset `fast`.
+- Timeout FFmpeg увеличен до 360 секунд, чтобы web-кодирование preset `medium` не обрывалось на длинных роликах.

@@ -18,7 +18,7 @@ const TELEGRAM_TARGET_OUTPUT_BYTES = Math.max(
   5 * MIB,
   Math.min(Number(process.env.TARGET_OUTPUT_MB || 44) * MIB, MAX_OUTPUT_BYTES - 2 * MIB),
 );
-const FFMPEG_TIMEOUT_MS = Number(process.env.FFMPEG_TIMEOUT_SECONDS || 240) * 1000;
+const FFMPEG_TIMEOUT_MS = Number(process.env.FFMPEG_TIMEOUT_SECONDS || 360) * 1000;
 const FFPROBE_TIMEOUT_MS = 30000;
 const POSTER_SECONDS = Math.min(3, Math.max(0.5, Number(process.env.POSTER_SECONDS || 1.5)));
 const AUDIO_BITRATE_KBPS = 128;
@@ -131,7 +131,7 @@ async function downloadSteamCover(coverUrl, outputPath) {
     response = await fetch(coverUrl, {
       redirect: 'follow',
       signal: AbortSignal.timeout(30000),
-      headers: { 'user-agent': 'GDZ-Steam-FFmpeg-Converter/1.1.0' },
+      headers: { 'user-agent': 'GDZ-Steam-FFmpeg-Converter/1.2.0' },
     });
   } catch (cause) {
     const error = new Error(`Steam cover download failed: ${cause.message}`);
@@ -213,14 +213,14 @@ function probeDuration(inputUrl, requestId) {
 function buildEncodingProfile(durationSeconds, profileName = 'telegram') {
   const webProfile = profileName === 'web';
   const targetOutputBytes = webProfile
-    ? Math.min(Number(process.env.WEB_TARGET_OUTPUT_MB || 12) * MIB, 14 * MIB)
+    ? Math.min(Number(process.env.WEB_TARGET_OUTPUT_MB || 36) * MIB, 40 * MIB)
     : TELEGRAM_TARGET_OUTPUT_BYTES;
   const maxOutputBytes = webProfile
-    ? Math.min(Number(process.env.WEB_MAX_OUTPUT_MB || 16) * MIB, 18 * MIB)
+    ? Math.min(Number(process.env.WEB_MAX_OUTPUT_MB || 42) * MIB, 46 * MIB)
     : MAX_OUTPUT_BYTES;
-  const audioKbps = webProfile ? 96 : AUDIO_BITRATE_KBPS;
-  const minVideoKbps = webProfile ? 280 : MIN_VIDEO_BITRATE_KBPS;
-  const maxVideoKbps = webProfile ? 2400 : MAX_VIDEO_BITRATE_KBPS;
+  const audioKbps = AUDIO_BITRATE_KBPS;
+  const minVideoKbps = webProfile ? 700 : MIN_VIDEO_BITRATE_KBPS;
+  const maxVideoKbps = webProfile ? 4000 : MAX_VIDEO_BITRATE_KBPS;
   const budgetKbps = Math.floor((targetOutputBytes * 8 * 0.96) / durationSeconds / 1000);
   const uncappedVideoKbps = budgetKbps - audioKbps;
   if (uncappedVideoKbps < minVideoKbps) {
@@ -237,6 +237,7 @@ function buildEncodingProfile(durationSeconds, profileName = 'telegram') {
     audioKbps,
     targetOutputBytes,
     maxOutputBytes,
+    preset: webProfile ? 'medium' : 'fast',
     videoKbps,
     maxrateKbps: Math.ceil(videoKbps * 1.1),
     bufsizeKbps: videoKbps * 2,
@@ -263,7 +264,7 @@ async function runFfmpegStream(inputUrl, coverPath, response, requestId, profile
       '-map', '[v]',
       '-map', '0:a:0?',
       '-c:v', 'libx264',
-      '-preset', 'fast',
+      '-preset', profile.preset,
       '-b:v', `${profile.videoKbps}k`,
       '-maxrate', `${profile.maxrateKbps}k`,
       '-bufsize', `${profile.bufsizeKbps}k`,
@@ -365,6 +366,7 @@ async function handleConvert(req, res) {
       profile: profile.name,
       target_output_mb: Number((profile.targetOutputBytes / MIB).toFixed(2)),
       video_bitrate_kbps: profile.videoKbps,
+      encoding_preset: profile.preset,
       output_width: profile.width,
       output_height: profile.height,
       streaming_mode: 'fragmented_mp4',
@@ -418,7 +420,7 @@ async function handleConvert(req, res) {
 
 const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
-    return sendJson(res, 200, { status: 'ok', service: 'gdz-steam-ffmpeg-converter', version: '1.1.0', profiles: ['telegram', 'web'] });
+    return sendJson(res, 200, { status: 'ok', service: 'gdz-steam-ffmpeg-converter', version: '1.2.0', profiles: ['telegram', 'web'] });
   }
   if (req.method === 'POST' && req.url === '/convert') {
     return handleConvert(req, res);
@@ -435,4 +437,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { buildEncodingProfile, probeDuration, runFfmpegStream };
+module.exports = { buildEncodingProfile, probeDuration, runFfmpegStream, server };

@@ -99,15 +99,18 @@ function runFfmpeg(inputUrl, outputPath, requestId) {
       '-i', inputUrl,
       '-map', '0:v:0',
       '-map', '0:a:0?',
-      // libx264 with yuv420p requires even frame dimensions. A fixed even
-      // width plus -2 for height preserves aspect ratio and guarantees both.
-      '-vf', 'scale=854:-2',
+      // Steam trailers are normally 16:9. A fixed even 1280 px width plus -2
+      // preserves the source aspect ratio and guarantees an even height for
+      // libx264/yuv420p. There is no crop, square canvas or stretching.
+      '-vf', 'scale=1280:-2',
       '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '23',
+      '-preset', 'fast',
+      '-crf', '20',
+      '-profile:v', 'high',
+      '-level:v', '4.0',
       '-pix_fmt', 'yuv420p',
       '-c:a', 'aac',
-      '-b:a', '128k',
+      '-b:a', '160k',
       '-movflags', '+faststart',
       '-max_muxing_queue_size', '2048',
       '-y', outputPath,

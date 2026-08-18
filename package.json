@@ -1,6 +1,6 @@
 {
   "name": "gdz-steam-ffmpeg-converter",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "description": "Authenticated Steam HLS to Telegram-compatible MP4 converter",
   "main": "server.js",

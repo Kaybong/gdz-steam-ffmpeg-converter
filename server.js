@@ -2,8 +2,7 @@
 
 const http = require('node:http');
 const { spawn } = require('node:child_process');
-const { promises: fs } = require('node:fs');
-const { Transform } = require('node:stream');
+const { promises: fs, createReadStream } = require('node:fs');
 const { pipeline } = require('node:stream/promises');
 const { randomUUID, timingSafeEqual } = require('node:crypto');
 const path = require('node:path');
@@ -24,6 +23,8 @@ const POSTER_SECONDS = Math.min(3, Math.max(0.5, Number(process.env.POSTER_SECON
 const AUDIO_BITRATE_KBPS = 128;
 const MAX_VIDEO_BITRATE_KBPS = 4500;
 const MIN_VIDEO_BITRATE_KBPS = 350;
+const MIN_WEB_OUTPUT_VIDEO_BITRATE_KBPS = 900;
+const OUTPUT_DURATION_TOLERANCE_SECONDS = 2.5;
 const ALLOWED_HOSTS = new Set([
   'video.akamai.steamstatic.com',
   'cdn.akamai.steamstatic.com',
@@ -210,6 +211,53 @@ function probeDuration(inputUrl, requestId) {
   });
 }
 
+function probeOutput(outputPath, requestId) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-v', 'error',
+      '-show_entries', 'format=duration,size,bit_rate',
+      '-show_entries', 'stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate',
+      '-of', 'json',
+      outputPath,
+    ];
+    const child = spawn('ffprobe', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout = (stdout + chunk.toString()).slice(-20000);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr = (stderr + chunk.toString()).slice(-4000);
+    });
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      const error = new Error('Output validation timed out');
+      error.code = 'OUTPUT_VALIDATION_TIMEOUT';
+      error.statusCode = 504;
+      reject(error);
+    }, FFPROBE_TIMEOUT_MS);
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('close', (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        try {
+          return resolve(JSON.parse(stdout));
+        } catch {
+          // handled below
+        }
+      }
+      const error = new Error('Unable to validate converted trailer');
+      error.code = 'OUTPUT_VALIDATION_FAILED';
+      error.statusCode = 502;
+      log('error', 'output_probe_failed', { request_id: requestId, code, signal, output: stderr });
+      reject(error);
+    });
+  });
+}
+
 function buildEncodingProfile(durationSeconds, profileName = 'telegram') {
   const webProfile = profileName === 'web';
   const targetOutputBytes = webProfile
@@ -237,14 +285,14 @@ function buildEncodingProfile(durationSeconds, profileName = 'telegram') {
     audioKbps,
     targetOutputBytes,
     maxOutputBytes,
-    preset: webProfile ? 'medium' : 'fast',
+    preset: 'fast',
     videoKbps,
     maxrateKbps: Math.ceil(videoKbps * 1.1),
     bufsizeKbps: videoKbps * 2,
   };
 }
 
-async function runFfmpegStream(inputUrl, coverPath, response, requestId, profile) {
+async function runFfmpegFile(inputUrl, coverPath, outputPath, requestId, profile) {
     const filter = [
       `[0:v:0]scale=${profile.width}:${profile.height}:force_original_aspect_ratio=decrease,` +
         `pad=${profile.width}:${profile.height}:(ow-iw)/2:(oh-ih)/2,setsar=1[main]`,
@@ -274,29 +322,16 @@ async function runFfmpegStream(inputUrl, coverPath, response, requestId, profile
       '-c:a', 'aac',
       '-b:a', `${profile.audioKbps}k`,
       '-force_key_frames', 'expr:gte(t,n_forced*2)',
-      '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
+      '-movflags', '+faststart',
       '-max_muxing_queue_size', '2048',
-      '-f', 'mp4',
-      'pipe:1',
+      '-y',
+      outputPath,
     ];
-    const child = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
-    let outputBytes = 0;
     let timedOut = false;
     child.stderr.on('data', (chunk) => {
       stderr = (stderr + chunk.toString()).slice(-8000);
-    });
-    const counter = new Transform({
-      transform(chunk, encoding, callback) {
-        outputBytes += chunk.length;
-        if (outputBytes > profile.maxOutputBytes) {
-          const error = new Error(`Output exceeds ${Math.floor(profile.maxOutputBytes / MIB)} MB limit`);
-          error.code = 'OUTPUT_TOO_LARGE';
-          error.statusCode = 413;
-          return callback(error);
-        }
-        callback(null, chunk);
-      },
     });
     const timer = setTimeout(() => {
       timedOut = true;
@@ -320,19 +355,60 @@ async function runFfmpegStream(inputUrl, coverPath, response, requestId, profile
       });
     });
     try {
-      await Promise.all([childDone, pipeline(child.stdout, counter, response)]);
-      return outputBytes;
+      await childDone;
+      return await fs.stat(outputPath);
     } catch (cause) {
       if (child.exitCode === null && !child.killed) child.kill('SIGKILL');
-      if (cause?.code === 'ERR_STREAM_PREMATURE_CLOSE') {
-        const error = new Error('Client disconnected before conversion completed');
-        error.code = 'CLIENT_DISCONNECTED';
-        throw error;
-      }
       throw cause;
     } finally {
       clearTimeout(timer);
     }
+}
+
+async function validateOutput(outputPath, expectedDurationSeconds, profile, requestId) {
+  const [probe, stat] = await Promise.all([
+    probeOutput(outputPath, requestId),
+    fs.stat(outputPath),
+  ]);
+  const durationSeconds = Number(probe?.format?.duration);
+  const video = Array.isArray(probe?.streams)
+    ? probe.streams.find((stream) => stream.codec_type === 'video')
+    : null;
+  const videoBitrateKbps = Math.floor(Number(video?.bit_rate || 0) / 1000);
+  const allowedShortfall = Math.max(
+    OUTPUT_DURATION_TOLERANCE_SECONDS,
+    expectedDurationSeconds * 0.02,
+  );
+  if (!Number.isFinite(durationSeconds) || durationSeconds < expectedDurationSeconds - allowedShortfall) {
+    const error = new Error(
+      `Converted trailer is incomplete: expected ${expectedDurationSeconds.toFixed(3)}s, got ${Number.isFinite(durationSeconds) ? durationSeconds.toFixed(3) : 'unknown'}s`,
+    );
+    error.code = 'OUTPUT_DURATION_MISMATCH';
+    error.statusCode = 502;
+    throw error;
+  }
+  if (stat.size <= 0 || stat.size > profile.maxOutputBytes) {
+    const error = new Error(`Output size is outside the configured limit: ${stat.size} bytes`);
+    error.code = 'OUTPUT_SIZE_INVALID';
+    error.statusCode = 413;
+    throw error;
+  }
+  if (!video || video.codec_name !== 'h264' || Number(video.width) !== profile.width || Number(video.height) !== profile.height) {
+    const error = new Error('Converted trailer video stream does not match the required H.264 1280x720 profile');
+    error.code = 'OUTPUT_VIDEO_PROFILE_INVALID';
+    error.statusCode = 502;
+    throw error;
+  }
+  const minimumVideoBitrateKbps = profile.name === 'web'
+    ? MIN_WEB_OUTPUT_VIDEO_BITRATE_KBPS
+    : Math.min(250, profile.videoKbps);
+  if (!Number.isFinite(videoBitrateKbps) || videoBitrateKbps < minimumVideoBitrateKbps) {
+    const error = new Error(`Converted trailer bitrate is too low: ${videoBitrateKbps || 0} kbps`);
+    error.code = 'OUTPUT_BITRATE_TOO_LOW';
+    error.statusCode = 502;
+    throw error;
+  }
+  return { durationSeconds, sizeBytes: stat.size, videoBitrateKbps };
 }
 
 async function handleConvert(req, res) {
@@ -353,6 +429,7 @@ async function handleConvert(req, res) {
     const coverUrl = validateSteamCover(body.cover_url);
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gdz-ffmpeg-'));
     const coverPath = path.join(tempDir, 'poster.jpg');
+    const outputPath = path.join(tempDir, `steam-trailer-${profileName}.mp4`);
     const coverBytes = await downloadSteamCover(coverUrl, coverPath);
     const durationSeconds = await probeDuration(inputUrl, requestId);
     const profile = buildEncodingProfile(durationSeconds, profileName);
@@ -369,11 +446,15 @@ async function handleConvert(req, res) {
       encoding_preset: profile.preset,
       output_width: profile.width,
       output_height: profile.height,
-      streaming_mode: 'fragmented_mp4',
+      output_mode: 'validated_file',
     });
+    const outputStat = await runFfmpegFile(inputUrl, coverPath, outputPath, requestId, profile);
+    if (!outputStat.size) throw new Error('FFmpeg produced an empty output file');
+    const validated = await validateOutput(outputPath, durationSeconds, profile, requestId);
     res.writeHead(200, {
       'content-type': 'video/mp4',
       'content-disposition': `attachment; filename="steam-trailer-${profile.name}.mp4"`,
+      'content-length': String(validated.sizeBytes),
       'cache-control': 'no-store, no-transform',
       'x-accel-buffering': 'no',
       'x-request-id': requestId,
@@ -382,22 +463,26 @@ async function handleConvert(req, res) {
       'x-output-width': String(profile.width),
       'x-output-height': String(profile.height),
       'x-conversion-profile': profile.name,
-      'x-streaming-mode': 'fragmented-mp4',
+      'x-output-duration-seconds': validated.durationSeconds.toFixed(3),
+      'x-input-duration-seconds': durationSeconds.toFixed(3),
+      'x-output-video-bitrate-kbps': String(validated.videoBitrateKbps),
+      'x-output-mode': 'validated-file',
     });
     res.socket?.setKeepAlive(true, 30000);
     res.flushHeaders();
-    const outputBytes = await runFfmpegStream(inputUrl, coverPath, res, requestId, profile);
-    if (!outputBytes) throw new Error('FFmpeg produced an empty output stream');
+    await pipeline(createReadStream(outputPath), res);
     log('info', 'conversion_finished', {
       request_id: requestId,
       duration_ms: Date.now() - startedAt,
-      output_bytes: outputBytes,
+      output_bytes: validated.sizeBytes,
+      output_duration_seconds: Number(validated.durationSeconds.toFixed(3)),
+      output_video_bitrate_kbps: validated.videoBitrateKbps,
       video_bitrate_kbps: profile.videoKbps,
       output_width: profile.width,
       output_height: profile.height,
     });
   } catch (error) {
-    const clientDisconnected = error.code === 'CLIENT_DISCONNECTED';
+    const clientDisconnected = error.code === 'ERR_STREAM_PREMATURE_CLOSE';
     log(clientDisconnected ? 'warn' : 'error', clientDisconnected ? 'conversion_cancelled' : 'conversion_error', {
       request_id: requestId,
       message: error.message,
@@ -420,7 +505,7 @@ async function handleConvert(req, res) {
 
 const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
-    return sendJson(res, 200, { status: 'ok', service: 'gdz-steam-ffmpeg-converter', version: '1.2.0', profiles: ['telegram', 'web'] });
+    return sendJson(res, 200, { status: 'ok', service: 'gdz-steam-ffmpeg-converter', version: '1.2.1', profiles: ['telegram', 'web'], output_mode: 'validated_file' });
   }
   if (req.method === 'POST' && req.url === '/convert') {
     return handleConvert(req, res);
@@ -437,4 +522,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { buildEncodingProfile, probeDuration, runFfmpegStream, server };
+module.exports = { buildEncodingProfile, probeDuration, probeOutput, runFfmpegFile, validateOutput, server };
